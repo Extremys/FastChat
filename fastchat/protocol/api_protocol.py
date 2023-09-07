@@ -166,3 +166,48 @@ class CompletionStreamResponse(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: List[CompletionResponseStreamChoice]
+
+class APITextGenerationParam(BaseModel):
+    best_of: Optional[int] = None
+    decoder_input_details: Optional[bool] = None
+    details: Optional[bool] = None
+    do_sample: Optional[bool] = None
+    max_new_tokens: Optional[int] = 512
+    repetition_penalty: Optional[float] = None
+    return_full_text: Optional[bool] = None
+    seed: Optional[int] = None
+    stop: Optional[List[str]] = None
+    temperature: Optional[float] = 1.
+    top_k: Optional[int] = 10.
+    top_p: Optional[float] = None
+    truncate: Optional[int] = None
+    typical_p: Optional[float] = .95
+    watermark: Optional[bool] = None
+
+
+class APITextGenerationRequest(BaseModel):
+    inputs: str
+    parameters: Optional[APITextGenerationParam] = None
+
+# {
+#   "inputs": "My name is Olivier and I",
+#   "parameters": {
+#     "best_of": 1,
+#     "decoder_input_details": true,
+#     "details": true,
+#     "do_sample": true,
+#     "max_new_tokens": 20,
+#     "repetition_penalty": 1.03,
+#     "return_full_text": false,
+#     "seed": null,
+#     "stop": [
+#       "photographer"
+#     ],
+#     "temperature": 0.5,
+#     "top_k": 10,
+#     "top_p": 0.95,
+#     "truncate": null,
+#     "typical_p": 0.95,
+#     "watermark": true
+#   }
+# }

@@ -26,6 +26,7 @@ from pydantic import BaseSettings
 import shortuuid
 import tiktoken
 import uvicorn
+import random
 
 from fastchat.constants import (
     WORKER_API_TIMEOUT,
@@ -59,6 +60,8 @@ from fastchat.protocol.api_protocol import (
     APITokenCheckRequest,
     APITokenCheckResponse,
     APITokenCheckResponseItem,
+    APITextGenerationRequest,
+    APITextGenerationParam,
 )
 
 logger = logging.getLogger(__name__)
@@ -142,6 +145,17 @@ async def check_model(request) -> Optional[JSONResponse]:
         )
     return ret
 
+async def check_model_name(model_name) -> Optional[JSONResponse]:
+    controller_address = app_settings.controller_address
+    ret = None
+
+    models = await fetch_remote(controller_address + "/list_models", None, "models")
+    if model_name not in models:
+        ret = create_error_response(
+            ErrorCode.INVALID_MODEL,
+            f"Only {'&&'.join(models)} allowed now, your model {model_name}",
+        )
+    return ret
 
 async def check_length(request, prompt, max_tokens, worker_addr):
     context_len = await fetch_remote(
@@ -164,6 +178,26 @@ async def check_length(request, prompt, max_tokens, worker_addr):
     else:
         return None
 
+async def check_length_hf(model_name, prompt, max_tokens, worker_addr):
+    context_len = await fetch_remote(
+        worker_addr + "/model_details", {"model": model_name}, "context_length"
+    )
+    token_num = await fetch_remote(
+        worker_addr + "/count_token",
+        {"model": model_name, "prompt": prompt},
+        "count",
+    )
+    if token_num + max_tokens > context_len:
+        return create_error_response(
+            ErrorCode.CONTEXT_OVERFLOW,
+            f"This model's maximum context length is {context_len} tokens. "
+            f"However, you requested {max_tokens + token_num} tokens "
+            f"({token_num} in the messages, "
+            f"{max_tokens} in the completion). "
+            f"Please reduce the length of the messages or completion.",
+        )
+    else:
+        return None
 
 def check_requests(request) -> Optional[JSONResponse]:
     # Check all params
@@ -207,6 +241,42 @@ def check_requests(request) -> Optional[JSONResponse]:
 
     return None
 
+def check_requests_hf(request) -> Optional[JSONResponse]:
+    # Check all params
+    if request.parameters.max_new_tokens is not None and request.parameters.max_new_tokens <= 0:
+        return create_error_response(
+            ErrorCode.PARAM_OUT_OF_RANGE,
+            f"{request.parameters.max_new_tokens} is less than the minimum of 1 - 'max_new_tokens'",
+        )
+    if request.parameters.temperature is not None and request.parameters.temperature < 0:
+        return create_error_response(
+            ErrorCode.PARAM_OUT_OF_RANGE,
+            f"{request.parameters.temperature} is less than the minimum of 0 - 'temperature'",
+        )
+    if request.parameters.temperature is not None and request.parameters.temperature > 2:
+        return create_error_response(
+            ErrorCode.PARAM_OUT_OF_RANGE,
+            f"{request.parameters.temperature} is greater than the maximum of 2 - 'temperature'",
+        )
+    if request.parameters.top_p is not None and request.parameters.top_p < 0:
+        return create_error_response(
+            ErrorCode.PARAM_OUT_OF_RANGE,
+            f"{request.parameters.top_p} is less than the minimum of 0 - 'top_p'",
+        )
+    if request.parameters.top_p is not None and request.parameters.top_p > 1:
+        return create_error_response(
+            ErrorCode.PARAM_OUT_OF_RANGE,
+            f"{request.parameters.top_p} is greater than the maximum of 1 - 'temperature'",
+        )
+    if request.parameters.stop is not None and (
+        not isinstance(request.parameters.stop, str) and not isinstance(request.parameters.stop, list)
+    ):
+        return create_error_response(
+            ErrorCode.PARAM_OUT_OF_RANGE,
+            f"{request.parameters.stop} is not valid under any of the given schemas - 'stop'",
+        )
+
+    return None
 
 def process_input(model_name, inp):
     if isinstance(inp, str):
@@ -456,6 +526,55 @@ async def chat_completion_stream_generator(
     for finish_chunk in finish_stream_events:
         yield f"data: {finish_chunk.json(exclude_none=True, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
+
+async def chat_completion_stream_generator_hf(
+    model_name: str, gen_params: Dict[str, Any], n: int, worker_addr: str
+) -> Generator[str, Any, None]:
+    """
+    Event stream format:
+    https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#event_stream_format
+    """
+    id = f"chatcmpl-{shortuuid.random()}"
+    finish_stream_events = []
+    for i in range(n):
+        # First chunk with role
+        choice_data = ChatCompletionResponseStreamChoice(
+            index=i,
+            delta=DeltaMessage(role="assistant"),
+            finish_reason=None,
+        )
+        chunk = ChatCompletionStreamResponse(
+            id=id, choices=[choice_data], model=model_name
+        )
+        yield chunk.json(exclude_unset=True, ensure_ascii=False)
+
+        previous_text = ""
+        async for content in generate_completion_stream(gen_params, worker_addr):
+            if content["error_code"] != 0:
+                yield {json.dumps(content, ensure_ascii=False)}
+                return
+            decoded_unicode = content["text"].replace("\ufffd", "")
+            delta_text = decoded_unicode[len(previous_text) :]
+            previous_text = decoded_unicode
+
+            if len(delta_text) == 0:
+                delta_text = None
+            choice_data = ChatCompletionResponseStreamChoice(
+                index=i,
+                delta=DeltaMessage(content=delta_text),
+                finish_reason=content.get("finish_reason", None),
+            )
+            chunk = ChatCompletionStreamResponse(
+                id=id, choices=[choice_data], model=model_name
+            )
+            if delta_text is None:
+                if content.get("finish_reason", None) is not None:
+                    finish_stream_events.append(chunk)
+                continue
+            yield chunk.json(exclude_unset=True, ensure_ascii=False)
+    # There is not "content" field in the last delta message, so exclude_none to exclude field "content".
+    for finish_chunk in finish_stream_events:
+        yield finish_chunk.json(exclude_none=True, ensure_ascii=False)
 
 
 @app.post("/v1/completions", dependencies=[Depends(check_api_key)])
@@ -767,7 +886,128 @@ async def create_chat_completion(request: APIChatCompletionRequest):
 
 
 ### END GENERAL API - NOT OPENAI COMPATIBLE ###
+### HUGGINGFACE TEXT GENERATION API ####
+import re
+async def get_openai_stream_data(gen_params, model_name, worker_addr):
 
+    events = chat_completion_stream_generator_hf(
+    model_name, gen_params, 1, worker_addr
+    )
+    print(events)
+    # events = await openai.ChatCompletion.acreate(
+    #     model=model_name,
+    #     messages=[{"role": "user", "content": request.inputs}],
+    #     stream=True,
+    #     temperature = request.parameters['temperature'] if 'parameters' in request else DEFAULT_TEMPERATURE,
+    #     max_tokens = request.parameters['max_tokens'] if 'parameters' in request else DEFAULT_MAX_TOKENS,
+    #     )
+    
+    gen_text = ""
+    end = "\n\n"
+    tok_cnt = 0
+    #json_str = re.search(r'\{.*\}', events).group()
+
+    # Parse JSON
+    #json_data = json.loads(json_str)
+    async for event in events:
+        print(type(events))
+        print(type(event))
+        #if not event: continue
+        event = json.loads(event)
+        print(event)
+        try:      
+            content = event['choices'][0]['delta']['content']
+        except TypeError:
+            content = None
+        except KeyError:
+            content = None
+        print(event['choices'])
+        print(event['choices'][0])
+        finish_reason = event['choices'][0]['finish_reason']
+        tok_cnt += 1
+        if content or finish_reason != None:
+            if content:
+                gen_text += content
+            final_text = None
+            details = None
+            special = False
+            if finish_reason!=None:
+                final_text = gen_text
+                special = True
+                details = {"finish_reason":finish_reason,"generated_tokens":tok_cnt-1,"seed":None}
+                end = "\n\n\n"
+            tok = {
+                "token": {
+                    "id": random.randrange(0, 2**32),
+                    "text": content,
+                    "logprob": 0,
+                    "special": special,
+                },
+                "generated_text": final_text,
+                "details": details
+            }
+            json_string = json.dumps(tok,separators=(',', ':'))
+            result = f"data:{json_string}"
+            yield result + end
+            await asyncio.sleep(0)  # Allow other tasks to run
+
+# {
+#   "details": {
+#     "finish_reason": "length",
+#     "generated_tokens": 1,
+#     "seed": 42
+#   },
+#   "generated_text": "test",
+#   "token": {
+#     "id": 0,
+#     "logprob": -0.34,
+#     "special": false,
+#     "text": "test"
+#   }
+# }
+
+@app.post("/v1/{model_name}/generate_stream", dependencies=[Depends(check_api_key)])
+async def generate_stream_hf(request: APITextGenerationRequest, model_name: str = None):
+    """Creates embeddings for the text"""
+    error_check_ret = await check_model_name(model_name)
+    if error_check_ret is not None:
+        return error_check_ret
+    error_check_ret = check_requests_hf(request)
+    if error_check_ret is not None:
+        return error_check_ret
+
+    worker_addr = await get_worker_address(model_name)
+
+    gen_params = await get_gen_params(
+        model_name,
+        worker_addr,
+        request.inputs,
+        temperature=request.parameters.temperature,
+        top_p=request.parameters.top_p,
+        max_tokens=request.parameters.max_new_tokens,
+        echo=False,
+        stop=request.parameters.stop,
+    )
+
+    if request.parameters.repetition_penalty is not None:
+        gen_params["repetition_penalty"] = request.parameters.repetition_penalty
+
+    error_check_ret = await check_length_hf(
+        model_name,
+        gen_params["prompt"],
+        gen_params["max_new_tokens"],
+        worker_addr,
+    )
+    if error_check_ret is not None:
+        return error_check_ret
+
+#    generator = chat_completion_stream_generator_hf(
+#        model_name, gen_params, 1, worker_addr
+#    )
+#    return StreamingResponse(generator, media_type="text/event-stream, headers={"Content-Type": "text/event-stream"}")
+    return StreamingResponse(get_openai_stream_data(gen_params, model_name, worker_addr), media_type="text/event-stream", headers={"Content-Type": "text/event-stream"})
+
+### HUGGINGFACE TEXT GENERATION API ####
 
 def create_openai_api_server():
     parser = argparse.ArgumentParser(
